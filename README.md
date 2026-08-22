@@ -1,104 +1,192 @@
-# High-Performance In-Memory System with Event-Driven I/O
+# Hexagon
 
-## Overview
-This project demonstrates an optimized data retrieval system for **low-latency access** and **high throughput** in high-concurrency environments.  
-
-It combines:
-- In-memory architecture for fast data retrieval  
-- Event-driven I/O with `epoll()` for scalable, non-blocking operations  
-- I/O multiplexing to handle thousands of concurrent connections efficiently  
-- Pipelined request-response protocols to reduce I/O bottlenecks in single-threaded applications  
-
----
+Hexagon is a high-performance, in-memory data server written in C++17. It
+combines nonblocking network I/O, predictable-latency data structures, typed
+binary serialization, automatic expiration, and asynchronous cleanup in a
+compact systems-oriented architecture.
 
 ## Features
-- Low-latency in-memory data retrieval  
-- High concurrency support using non-blocking event-driven I/O  
-- Request pipelining for efficient request-response handling  
-- Single-threaded design with high throughput  
 
----
+- **Nonblocking event loop** built on `poll()` with partial read/write handling,
+  connection multiplexing, response buffering, and request pipelining.
+- **Progressively resized hash table** with intrusive chaining, O(1) average
+  lookup, stable node addresses, and bounded migration work per operation.
+- **Typed binary protocol** supporting nil, errors, byte strings, signed 64-bit
+  integers, doubles, and recursively nested arrays.
+- **Ordered collections** indexed simultaneously by member name and by the
+  `(score, name)` tuple.
+- **Augmented AVL tree** providing O(log N) insertion, deletion, lookup, and
+  rank-based offsets regardless of offset size.
+- **TTL expiration** backed by an indexed minimum heap for O(1) access to the
+  next deadline and O(log N) updates or removals.
+- **Idle connection management** using monotonic time and an intrusive timer
+  list; inactive clients are closed after five seconds.
+- **Worker thread pool** for moving expensive collection destruction out of the
+  event loop. Collections with more than 1,000 members are unlinked immediately
+  and reclaimed asynchronously.
+- **Bounded maintenance work** for both hash-table migration and mass expiration
+  so housekeeping cannot monopolize the event loop.
+- **Portable POSIX implementation** that builds on Linux and macOS.
 
 ## Architecture
-1. **In-Memory Data Store** – Minimizes disk I/O by keeping data in memory.  
-2. **Event-Driven I/O** – Uses `epoll()` to manage concurrent client connections.  
-3. **Request Pipelining** – Processes multiple requests without waiting for sequential responses.  
 
----
+| Layer | Implementation | Key property |
+| --- | --- | --- |
+| Networking | Nonblocking sockets and `poll()` | Concurrent connections without one thread per client |
+| Request processing | Length-prefixed pipelined messages | Handles fragmented and coalesced network reads |
+| Primary index | Intrusive chaining hash table | O(1) average access with progressive resizing |
+| Ordered index | Height-balanced AVL tree | O(log N) operations and rank offsets |
+| Ordered collection | Hash index plus AVL index | Fast member lookup and deterministic score ordering |
+| Expiration | Indexed minimum heap | Efficient arbitrary deadlines and direct removal |
+| Idle timers | Intrusive doubly-linked list | O(1) connection timer refresh |
+| Deferred cleanup | Four-worker pthread pool | Keeps large destructors off the event-loop thread |
+| Serialization | Typed TLV values | Unambiguous scalar and nested response types |
 
-## Workflow
-1. Listening socket is created.  
-2. In every loop iteration, a **new epoll fd** is created.  
-3. The listening socket and all active connections are added to this epoll instance.  
-4. `epoll_wait` waits for events from either the listening socket or the active connections.  
-5. If the event is on the listening socket → accept new connections and add them to the connections vector.  
-6. If the event is on a connection → read request data.  
-7. Requests follow a custom protocol:  
-   - Number of strings  
-   - Length of first string, first string  
-   - Length of second string, second string  
-   - … and so on.  
-8. The server parses the request according to this protocol.  
-9. The request is processed (`get`, `set`, `del`) and a response is generated with a response code and optional payload.  
-10. Response is written back to the client.  
+## Build
 
-### Visual Workflow (Mermaid Diagram)
+Requirements:
 
-```mermaid
-flowchart TD
-    A[Create socket] --> B[Event Loop iteration]
-    B --> C[Create new epoll fd & clear events]
-    C --> D[Add listening socket + connections]
-    D --> E[Wait for events epoll_wait]
+- C++17 compiler
+- POSIX sockets and pthreads
+- Make
+- Python 3 for integration tests
 
-    E -->|Listening socket event| F[Accept new connection]
-    E -->|Connection event| G[Read request buffer]
-
-    F --> H[Track connection in vector]
-    G --> I[Parse request → Process request]
-    I --> J[Generate Response]
-    J --> K[Send back to client]
-
-    K --> B
+```sh
+make
 ```
 
----
+The build creates two executables:
 
-## Getting Started
+- `server` — the data server
+- `client` — a command-line protocol client
 
-### Prerequisites
-- Linux system with `epoll` support  
-- `g++` compiler (C++11 or later)  
+## Run
 
-### Build
+The server listens on port `2203` by default. Pass a port as the first argument
+to use a different one.
 
-Compile the server:
-```bash
-g++ -std=c++11 -O2 server.cpp -o server
-```
-
-Compile the client:
-```bash
-g++ -std=c++11 -O2 client.cpp -o client
-```
-
-### Run
-
-Start the server:
-```bash
+```sh
 ./server
+./server 22303
 ```
 
-In another terminal, run the client:
-```bash
-./client
+Send commands with the client:
+
+```sh
+./client set greeting hello
+./client get greeting
+./client --port 22303 dbsize
 ```
 
-The client will send requests, and the server will respond using the in-memory, event-driven architecture.
+## Command reference
 
----
+| Command | Result |
+| --- | --- |
+| `get key` | String value or nil |
+| `set key value` | Nil on success; type error if the key contains an ordered collection |
+| `del key` | `1` if removed, otherwise `0` |
+| `dbsize` | Number of top-level keys |
+| `keys` | Unordered array of all top-level keys |
+| `pexpire key milliseconds` | `1` if the key exists, otherwise `0` |
+| `pttl key` | Milliseconds remaining, `-1` without a deadline, or `-2` if absent |
+| `persist key` | `1` if a deadline was removed, otherwise `0` |
+| `zadd key score member` | `1` for a new member, `0` for a score update |
+| `zrem key member` | `1` if removed, otherwise `0` |
+| `zscore key member` | Double score or nil |
+| `zquery key score member offset limit` | Flat member/score array beginning at the first tuple greater than or equal to `(score, member)` |
 
-## Future Work
-- Create a custom **hashmap** for optimal in-memory retrieval and support for additional data structures  
-- Implement **distributed in-memory caching** for scalability across multiple nodes  
-- Add **load balancing and sharding** to support large-scale deployments  
+### Key/value operations
+
+```sh
+./client set user:42 active
+./client get user:42
+./client dbsize
+./client keys
+./client del user:42
+```
+
+### Ordered collections
+
+```sh
+./client zadd leaderboard 10 alice
+./client zadd leaderboard 20 bob
+./client zscore leaderboard alice
+./client zquery leaderboard 0 "" 0 10
+./client zrem leaderboard alice
+```
+
+Members are ordered by score first and name second, which produces stable
+ordering when multiple members have the same score. `zquery` supports efficient
+positive or negative rank offsets without walking through every skipped member.
+
+### Expiration
+
+```sh
+./client set session:123 token
+./client pexpire session:123 5000
+./client pttl session:123
+./client persist session:123
+```
+
+Deadlines use a monotonic clock, so wall-clock adjustments do not affect
+existing timers. A negative `pexpire` duration removes the deadline; `persist`
+provides the explicit equivalent.
+
+## Wire protocol
+
+Every request begins with a 4-byte body length. The body contains an argument
+count followed by length-prefixed byte strings:
+
+```text
+u32 body_length
+u32 argument_count
+repeat argument_count times:
+    u32 argument_length
+    byte[argument_length] argument
+```
+
+Multiple complete requests can be written without waiting for their responses.
+The server parses all available frames and returns responses in request order.
+
+Responses also begin with a 4-byte body length. The body contains one typed TLV
+value:
+
+| Tag | Value | Encoding |
+| --- | --- | --- |
+| `0` | Nil | Tag only |
+| `1` | Error | Tag, `u32 code`, `u32 length`, bytes |
+| `2` | String | Tag, `u32 length`, bytes |
+| `3` | Integer | Tag, `i64` |
+| `4` | Double | Tag, IEEE-754 64-bit value |
+| `5` | Array | Tag, `u32 element_count`, recursively encoded values |
+
+Fixed-width values currently use host byte order, so communicating processes
+must use the same endianness.
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `server.cpp` | Event loop, protocol handling, commands, timers, and database state |
+| `client.cpp` | Command encoding and recursive response decoding |
+| `hashtable.*` | Progressive intrusive hash table |
+| `avl.*` | Height-balanced, rank-augmented binary tree |
+| `zset.*` | Dual-index ordered collection |
+| `heap.*` | Indexed minimum heap for expiration deadlines |
+| `list.h` | Intrusive circular doubly-linked list |
+| `thread_pool.*` | Pthread task queue and worker lifecycle |
+| `tests/` | Data-structure and end-to-end protocol tests |
+
+## Testing
+
+```sh
+make unit-test
+make integration-test
+make test
+```
+
+The unit suite validates hash-table growth, AVL invariants and offsets, ordered
+collection indexing, heap back-references, and worker execution. The integration
+suite covers command behavior, typed serialization, request pipelining,
+expiration, idle timeouts, progressive rehashing, and asynchronous destruction
+of a 1,001-member collection.

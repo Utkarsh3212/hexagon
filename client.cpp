@@ -1,150 +1,246 @@
-#include <assert.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <errno.h>
-#include <unistd.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
-#include <netinet/ip.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cerrno>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
-#define PORT 2203
+namespace {
 
-static void msg(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
+constexpr uint16_t kDefaultPort = 2203;
+constexpr size_t kMaxMessage = 32u << 20;
+
+[[noreturn]] void die(const char *message) {
+    std::fprintf(stderr, "[errno:%d] %s\n", errno, message);
+    std::exit(1);
 }
 
-static void die(const char *msg) {
-    int err = errno;
-    fprintf(stderr, "[%d] %s\n", err, msg);
-    abort();
-}
-
-static int32_t read_full(int fd, char *buf, size_t n) {
-    while (n > 0) {
-        ssize_t rv = read(fd, buf, n);
-        if (rv <= 0) {
-            return -1;  // error, or unexpected EOF
+bool read_full(int fd, uint8_t *buffer, size_t size) {
+    while (size > 0) {
+        const ssize_t count = read(fd, buffer, size);
+        if (count < 0 && errno == EINTR) {
+            continue;
         }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
-    }
-    return 0;
-}
-
-static int32_t write_all(int fd, const char *buf, size_t n) {
-    while (n > 0) {
-        ssize_t rv = write(fd, buf, n);
-        if (rv <= 0) {
-            return -1;  // error
+        if (count <= 0) {
+            return false;
         }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
+        buffer += count;
+        size -= static_cast<size_t>(count);
     }
-    return 0;
+    return true;
 }
 
-const size_t k_max_msg = 4096;
-
-// the `query` function was simply splited into `send_req` and `read_res`.
-static int32_t send_req(int fd, std::vector<std::string> &cmd) {
-    uint32_t len=4;
-    for(const std::string &s:cmd){
-        len+= 4+s.size();
+bool write_all(int fd, const uint8_t *buffer, size_t size) {
+    while (size > 0) {
+        const ssize_t count = write(fd, buffer, size);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            return false;
+        }
+        buffer += count;
+        size -= static_cast<size_t>(count);
     }
-    
-    if (len > k_max_msg) {
+    return true;
+}
+
+bool send_request(int fd, const std::vector<std::string> &command) {
+    size_t body_size = sizeof(uint32_t);
+    for (const std::string &argument : command) {
+        body_size += sizeof(uint32_t) + argument.size();
+    }
+    if (body_size > kMaxMessage || body_size > UINT32_MAX) {
+        std::fprintf(stderr, "request is too large\n");
+        return false;
+    }
+
+    std::vector<uint8_t> request(sizeof(uint32_t) + body_size);
+    const uint32_t body_length = static_cast<uint32_t>(body_size);
+    const uint32_t argument_count = static_cast<uint32_t>(command.size());
+    std::memcpy(request.data(), &body_length, sizeof(body_length));
+    std::memcpy(request.data() + sizeof(uint32_t), &argument_count,
+                sizeof(argument_count));
+
+    size_t cursor = sizeof(uint32_t) * 2;
+    for (const std::string &argument : command) {
+        const uint32_t length = static_cast<uint32_t>(argument.size());
+        std::memcpy(request.data() + cursor, &length, sizeof(length));
+        cursor += sizeof(length);
+        std::memcpy(request.data() + cursor, argument.data(), argument.size());
+        cursor += argument.size();
+    }
+    return write_all(fd, request.data(), request.size());
+}
+
+enum ValueTag : uint8_t {
+    TAG_NIL = 0,
+    TAG_ERROR = 1,
+    TAG_STRING = 2,
+    TAG_INTEGER = 3,
+    TAG_DOUBLE = 4,
+    TAG_ARRAY = 5,
+};
+
+bool available(size_t size, size_t cursor, size_t needed) {
+    return cursor <= size && needed <= size - cursor;
+}
+
+int64_t print_value(const uint8_t *data, size_t size, unsigned depth = 0) {
+    if (!size) {
         return -1;
     }
-    
-    char wbuf[4+k_max_msg];
-    memcpy(&wbuf[0],&len,4);
-    uint32_t n=cmd.size();
-    memcpy(&wbuf[4],&n,4);
-    uint32_t curr=8;
-    
-    for(const std::string &s:cmd){
-        uint32_t p=s.size();
-        memcpy(&wbuf[curr],&p,4);
-        memcpy(&wbuf[curr+4],s.data(),s.size());
-        curr+=4+s.size();
+    const char *indent = depth ? "  " : "";
+    switch (data[0]) {
+        case TAG_NIL:
+            std::printf("%s(nil)\n", indent);
+            return 1;
+        case TAG_ERROR: {
+            if (!available(size, 1, 8)) {
+                return -1;
+            }
+            uint32_t code = 0;
+            uint32_t length = 0;
+            std::memcpy(&code, data + 1, 4);
+            std::memcpy(&length, data + 5, 4);
+            if (!available(size, 9, length)) {
+                return -1;
+            }
+            std::printf("%s(error %u) ", indent, code);
+            std::fwrite(data + 9, 1, length, stdout);
+            std::putchar('\n');
+            return 9 + length;
+        }
+        case TAG_STRING: {
+            if (!available(size, 1, 4)) {
+                return -1;
+            }
+            uint32_t length = 0;
+            std::memcpy(&length, data + 1, 4);
+            if (!available(size, 5, length)) {
+                return -1;
+            }
+            std::printf("%s(string) ", indent);
+            std::fwrite(data + 5, 1, length, stdout);
+            std::putchar('\n');
+            return 5 + length;
+        }
+        case TAG_INTEGER: {
+            if (!available(size, 1, 8)) {
+                return -1;
+            }
+            int64_t value = 0;
+            std::memcpy(&value, data + 1, 8);
+            std::printf("%s(integer) %lld\n", indent,
+                        static_cast<long long>(value));
+            return 9;
+        }
+        case TAG_DOUBLE: {
+            if (!available(size, 1, 8)) {
+                return -1;
+            }
+            double value = 0;
+            std::memcpy(&value, data + 1, 8);
+            std::printf("%s(double) %g\n", indent, value);
+            return 9;
+        }
+        case TAG_ARRAY: {
+            if (!available(size, 1, 4)) {
+                return -1;
+            }
+            uint32_t length = 0;
+            std::memcpy(&length, data + 1, 4);
+            std::printf("%s(array) %u element(s)\n", indent, length);
+            size_t cursor = 5;
+            for (uint32_t i = 0; i < length; ++i) {
+                const int64_t consumed = print_value(data + cursor, size - cursor,
+                                                     depth + 1);
+                if (consumed < 0) {
+                    return -1;
+                }
+                cursor += static_cast<size_t>(consumed);
+            }
+            return static_cast<int64_t>(cursor);
+        }
+        default:
+            return -1;
     }
-    
-    return write_all(fd,wbuf,4+len);
 }
 
-static int32_t read_res(int fd) {
-    // 4 bytes header
-    char rbuf[4+k_max_msg];
+bool read_response(int fd) {
+    uint32_t length = 0;
+    if (!read_full(fd, reinterpret_cast<uint8_t *>(&length), sizeof(length))) {
+        std::fprintf(stderr, "failed to read response header\n");
+        return false;
+    }
+    if (length > kMaxMessage) {
+        std::fprintf(stderr, "response is too large\n");
+        return false;
+    }
+
+    std::vector<uint8_t> response(length);
+    if (!read_full(fd, response.data(), response.size())) {
+        std::fprintf(stderr, "failed to read response body\n");
+        return false;
+    }
+    const int64_t consumed = print_value(response.data(), response.size());
+    if (consumed < 0 || static_cast<size_t>(consumed) != response.size()) {
+        std::fprintf(stderr, "malformed response\n");
+        return false;
+    }
+    return true;
+}
+
+uint16_t parse_port(const char *text) {
+    char *end = nullptr;
     errno = 0;
-    int32_t err = read_full(fd, &rbuf[0], 4);
-    if (err) {
-        if (errno == 0) {
-            msg("EOF");
-        } else {
-            msg("read() error");
-        }
-        return err;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (errno || end == text || *end != '\0' || value == 0 ||
+        value > std::numeric_limits<uint16_t>::max()) {
+        std::fprintf(stderr, "invalid port: %s\n", text);
+        std::exit(2);
     }
-
-    uint32_t len = 0;
-    memcpy(&len,rbuf, 4);  // assume little endian
-    if (len > k_max_msg) {
-        msg("too long");
-        return -1;
-    }
-
-    err = read_full(fd, &rbuf[4], len);
-    if (err) {
-        msg("read() error");
-        return err;
-    }
-
-    uint32_t rescode=0;
-    if(len<4){
-        msg("bad response");
-        return -1;
-    }
-    
-    memcpy(&rescode,&rbuf[4],4);
-    printf("server says: [%u] %.*s\n",rescode,len-4,&rbuf[8]);
-    return 0;
+    return static_cast<uint16_t>(value);
 }
+
+}  // namespace
 
 int main(int argc, char **argv) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    std::signal(SIGPIPE, SIG_IGN);
+    uint16_t port = kDefaultPort;
+    int argument_index = 1;
+    if (argc >= 3 && std::strcmp(argv[1], "--port") == 0) {
+        port = parse_port(argv[2]);
+        argument_index = 3;
+    }
+
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         die("socket()");
     }
-
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = ntohs(PORT);
-    addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK);  // 127.0.0.1
-    int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
-    if (rv) {
-        die("connect");
-    }
-    
-    std::vector<std::string> cmd;
-    for(int i=1;i<argc;i++){
-        cmd.push_back(argv[i]);
-    }
-    int32_t err=send_req(fd,cmd);
-    if(err){
-        goto L_DONE;
-    }
-    err=read_res(fd);
-    if(err){
-        goto L_DONE;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, reinterpret_cast<const sockaddr *>(&address),
+                sizeof(address)) != 0) {
+        die("connect()");
     }
 
-L_DONE:
+    std::vector<std::string> command;
+    for (int i = argument_index; i < argc; ++i) {
+        command.emplace_back(argv[i]);
+    }
+    const bool ok = send_request(fd, command) && read_response(fd);
     close(fd);
-    return 0;
+    return ok ? 0 : 1;
 }
